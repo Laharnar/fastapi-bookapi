@@ -4,11 +4,12 @@ from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
+import httpx
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
-
+http_client = httpx.AsyncClient()
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(request:Request):
@@ -123,4 +124,80 @@ async def readBooks(skip = 0, limit = 10):
 async def searchBooks(search = "", skip = 0, limit = 10):
     query = "SELECT id, author_id, title FROM books"
     books = searchItems(query, search, limit, skip)
+    return books
+
+from typing import List, Union, Dict, Any
+from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+class GoogleBook(BaseModel):
+    title: str = Field('No Title Available')
+    authors: List[str] = Field(default_factory=list)
+    publisher: Union[str, None] = None
+    publishedDate: Union[str, None] = None
+    # We can use Field to set a default value for complex nested data
+    infoLink: str = Field(default=None, alias='infoLink')
+
+    # Configuration to handle the complex dictionary structure from the API
+    class Config:
+        populate_by_name = True # Allows Pydantic to use the alias 'infoLink'
+
+async def searchBooksAPI(search, limit, skip):
+    BASE_URL = "https://www.googleapis.com/books/v1/volumes"
+    params = {
+        "q": search,  # The search term (e.g., "fastapi python")
+        "maxResults": limit,  # Pagination limit (max 40)
+        "startIndex": skip,  # Pagination offset
+        # "key": "YOUR_API_KEY", # Optional: Use your API key for higher limits
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            # 1. Make the GET request
+            response = await client.get(BASE_URL, params=params, timeout=5)
+            response.raise_for_status()  # Raises an exception for 4xx/5xx status codes
+
+            data = response.json()
+
+            # 2. Check if the 'items' key exists and if there are results
+            if not data.get('items'):
+                return []
+
+            books_list = []
+
+            # 3. Iterate and map/clean the data
+            for item in data['items']:
+                volume_info = item.get('volumeInfo', {})
+
+                # Manual data cleaning/default assignment to ensure consistency
+                book_data = {
+                    'title': volume_info.get('title'),
+                    'authors': volume_info.get('authors', []),
+                    'publisher': volume_info.get('publisher'),
+                    'publishedDate': volume_info.get('publishedDate'),
+                    'infoLink': volume_info.get('infoLink')
+                }
+
+                # 4. Validate and create the Pydantic model
+                books_list.append(GoogleBook.model_validate(book_data))
+
+            return books_list
+
+        except httpx.HTTPStatusError as e:
+            # Handle bad status codes (e.g., 404, 503)
+            raise HTTPException(status_code=e.response.status_code, detail=f"Google Books API error: {e.response.text}")
+        except httpx.RequestError:
+            # Handle connection errors, DNS failure, etc.
+            raise HTTPException(status_code=503, detail="Could not connect to the Google Books API service.")
+        except ValidationError as e:
+            # 💡 Allow the Pydantic error to show up as an informative 422
+            raise HTTPException(status_code=422, detail=f"Data validation failed: {e.errors()}")
+        except Exception as e:
+            # Only catch truly unexpected errors here
+            # 🐛 Print the error for debugging, then raise 500
+            print(f"UNHANDLED ERROR: {e}")
+            raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred. {e}")
+
+@app.get("/books/search2", response_model=list[GoogleBook])
+async def searchBooks(search = "", skip = 0, limit = 10):
+    books = await searchBooksAPI(search, limit, skip)
     return books
